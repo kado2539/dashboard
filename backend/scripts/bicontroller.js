@@ -29,23 +29,9 @@ if (!fs.existsSync(SETTINGS_FILE)) {
 const biController = {
     getDashboardData: async (req, res) => {
         try {
-            // 1. Fetch all metrics
+            // 1. Fetch all metrics and top products from HeidiSQL
             const [metrics] = await db.query('SELECT * FROM dashboard_metrics');
-
-            // Prefer the canonical `products` table for dashboard top products so the dashboard matches the products page.
-            let topProducts = [];
-            try {
-                const [prodRows] = await db.query(`SELECT id, product_id, sku, COALESCE(product_name, name, title) AS product_name, price, retail_price, revenue, sales_count FROM products ORDER BY revenue DESC LIMIT 10`);
-                if (prodRows && prodRows.length) {
-                    topProducts = prodRows;
-                } else {
-                    const [tp] = await db.query('SELECT * FROM top_products ORDER BY revenue DESC LIMIT 10');
-                    topProducts = tp;
-                }
-            } catch (err) {
-                // products table may not exist: fall back to top_products
-                try { const [tp] = await db.query('SELECT * FROM top_products ORDER BY revenue DESC LIMIT 10'); topProducts = tp; } catch (e) { topProducts = []; }
-            }
+            const [topProducts] = await db.query('SELECT * FROM top_products ORDER BY revenue DESC');
 
             // 2. Logic-based Alert System (Matches your specific requirements)
             const alerts = [];
@@ -204,9 +190,8 @@ const biController = {
     ,
     // List products endpoint: tries 'products' table then fallback to 'top_products'
     listProducts: async (req, res) => {
-        // Query params: q (search), page, pageSize, minRevenue, sku
+        // Query params: q (search), page, pageSize, minRevenue
         const q = (req.query.q || '').trim();
-        const sku = (req.query.sku || '').trim();
         const page = Math.max(1, Number(req.query.page) || 1);
         const pageSize = Math.min(200, Math.max(5, Number(req.query.pageSize) || 20));
         const offset = (page - 1) * pageSize;
@@ -217,14 +202,11 @@ const biController = {
             try {
                 let where = 'WHERE 1=1';
                 const params = [];
-                if (sku) { where += ' AND (sku = ?)'; params.push(sku); }
-                else if (q) { where += ' AND (product_name LIKE ? OR sku LIKE ?)'; params.push(`%${q}%`, `%${q}%`); }
+                if (q) { where += ' AND (product_name LIKE ? OR sku LIKE ?)'; params.push(`%${q}%`, `%${q}%`); }
                 if (minRevenue > 0) { where += ' AND (price >= ?)'; params.push(minRevenue); }
 
                 const [rows] = await db.query(`SELECT SQL_CALC_FOUND_ROWS * FROM products ${where} ORDER BY product_name ASC LIMIT ? OFFSET ?`, [...params, pageSize, offset]);
                 const [[{ 'FOUND_ROWS()': total }]] = await db.query('SELECT FOUND_ROWS()');
-                // mark exact SKU matches
-                if (sku && rows && rows.length) rows = rows.map(r => ({ ...r, matchedBy: 'sku' }));
                 return res.json({ success: true, products: rows, meta: { total: Number(total), page, pageSize } });
             } catch (inner) {
                 // products table may not exist, fall back
@@ -233,54 +215,14 @@ const biController = {
             // fallback: query top_products with optional filters
             let sql = 'SELECT * FROM top_products';
             const args = [];
-            if (sku) { sql += ' WHERE sku = ?'; args.push(sku); }
-            else if (q) { sql += ' WHERE product_name LIKE ?'; args.push(`%${q}%`); }
+            if (q) { sql += ' WHERE product_name LIKE ?'; args.push(`%${q}%`); }
             sql += ' ORDER BY revenue DESC LIMIT ? OFFSET ?';
             const [top] = await db.query(sql, [...args, pageSize, offset]);
-            // annotate matchedBy for fallback
-            const annotated = top.map(t => ({ ...t, matchedBy: sku ? 'sku' : (q ? 'query' : 'none') }));
-            return res.json({ success: true, products: annotated, meta: { total: top.length, page, pageSize } });
+            // no good way to get total in fallback; return fetched length
+            return res.json({ success: true, products: top, meta: { total: top.length, page, pageSize } });
         } catch (error) {
             console.error('ListProducts error:', error);
             return res.status(500).json({ success: false, message: 'Products Error' });
-        }
-    }
-    ,
-    // Reconciliation endpoint: return products, top_products and suggested mappings
-    reconcileProducts: async (req, res) => {
-        try {
-            let products = [];
-            let topProducts = [];
-            try {
-                const [pRows] = await db.query('SELECT id, product_id, sku, COALESCE(product_name, name, title) as product_name, price, revenue FROM products');
-                products = pRows || [];
-            } catch (err) {
-                products = [];
-            }
-
-            try {
-                const [tRows] = await db.query('SELECT id, product_id, sku, product_name, revenue FROM top_products');
-                topProducts = tRows || [];
-            } catch (err) {
-                topProducts = [];
-            }
-
-            // Build a simple mapping: try to match by sku, then product_id, then fuzzy name (case-insensitive contains)
-            const mappings = topProducts.map(tp => {
-                const matchBySku = products.find(p => p.sku && tp.sku && String(p.sku).toLowerCase() === String(tp.sku).toLowerCase());
-                if (matchBySku) return { topProduct: tp, product: matchBySku, matchedBy: 'sku' };
-                const matchByPid = products.find(p => (p.product_id && tp.product_id && String(p.product_id) === String(tp.product_id)) || (p.id && tp.product_id && String(p.id) === String(tp.product_id)));
-                if (matchByPid) return { topProduct: tp, product: matchByPid, matchedBy: 'product_id' };
-                const nameLower = (tp.product_name || '').toLowerCase();
-                const matchByName = products.find(p => (p.product_name || '').toLowerCase().includes(nameLower) || nameLower.includes((p.product_name || '').toLowerCase()));
-                if (matchByName) return { topProduct: tp, product: matchByName, matchedBy: 'name' };
-                return { topProduct: tp, product: null, matchedBy: 'none' };
-            });
-
-            return res.json({ success: true, products, topProducts, mappings });
-        } catch (error) {
-            console.error('ReconcileProducts error:', error);
-            return res.status(500).json({ success: false, message: 'Reconciliation Error' });
         }
     }
     ,
@@ -325,53 +267,11 @@ const biController = {
         }
     }
     ,
-    // Return a canonical product object by id/sku
-    getProduct: async (req, res) => {
-        const idOrSku = req.params.id;
-        try {
-            // Try to find by numeric id in products
-            try {
-                const [pRows] = await db.query('SELECT * FROM products WHERE id = ? OR product_id = ? LIMIT 1', [idOrSku, idOrSku]);
-                if (pRows && pRows.length) {
-                    const p = pRows[0];
-                    console.debug('getProduct: found in products by id', p.id);
-                    return res.json({ success: true, product: { id: p.id, product_id: p.product_id || p.id, sku: p.sku || null, product_name: p.product_name || p.name || p.title, price: p.price, retail_price: p.retail_price, revenue: p.revenue, units_sold: p.units_sold || p.sales_count || null, source: 'products', matchedBy: 'id' } });
-                }
-            } catch (ignore) { }
-
-            // Try exact sku match in products
-            try {
-                const [sRows] = await db.query('SELECT * FROM products WHERE sku = ? LIMIT 1', [idOrSku]);
-                if (sRows && sRows.length) {
-                    const p = sRows[0];
-                    console.debug('getProduct: found in products by sku', p.sku);
-                    return res.json({ success: true, product: { id: p.id, product_id: p.product_id || p.id, sku: p.sku || null, product_name: p.product_name || p.name || p.title, price: p.price, retail_price: p.retail_price, revenue: p.revenue, units_sold: p.units_sold || p.sales_count || null, source: 'products', matchedBy: 'sku' } });
-                }
-            } catch (ignore) { }
-
-            // Fallback to top_products
-            try {
-                const [tRows] = await db.query('SELECT * FROM top_products WHERE id = ? OR product_id = ? OR sku = ? LIMIT 1', [idOrSku, idOrSku, idOrSku]);
-                if (tRows && tRows.length) {
-                    const p = tRows[0];
-                    console.debug('getProduct: found in top_products fallback', p.id || p.product_id || p.sku);
-                    return res.json({ success: true, product: { id: p.id, product_id: p.product_id || p.id, sku: p.sku || null, product_name: p.product_name || p.name || p.title, price: p.price || p.revenue, retail_price: p.retail_price, revenue: p.revenue, units_sold: p.sales_count || null, source: 'top_products', matchedBy: 'fallback' } });
-                }
-            } catch (ignore) { }
-
-            return res.status(404).json({ success: false, message: 'Product not found' });
-        } catch (error) {
-            console.error('GetProduct error:', error);
-            return res.status(500).json({ success: false, message: 'Product Lookup Error' });
-        }
-    }
-    ,
     // Product analytics: compute moving averages and catalog comparisons
     getProductAnalytics: async (req, res) => {
         const id = req.params.id;
         const days = Number(req.query.days) || 90;
         try {
-            console.debug('getProductAnalytics start', { id, days });
             // fetch sales history (prefer products_sales)
             let history = [];
             try {
@@ -418,7 +318,6 @@ const biController = {
 
             const ma7 = movingAverage(history, 7);
             const ma30 = movingAverage(history, 30);
-            console.debug('getProductAnalytics computed ma lengths', { history: history.length, ma7: ma7.length, ma30: ma30.length });
 
             // catalog average price for comparison
             let avgPrice = null;

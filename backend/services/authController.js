@@ -1,42 +1,62 @@
-const fs = require('fs');
-const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify([], null, 2));
+const db = require('../database/connection');
 
 const SECRET = process.env.JWT_SECRET || 'dev_secret';
-
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
 // in-memory online users tracking { userId: lastSeenMs }
 const onlineUsers = {};
 
-const readUsers = () => JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-const writeUsers = (u) => fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2));
+// cache user table columns
+let _userCols = null;
+async function getUserCols() {
+    if (_userCols) return _userCols;
+    try {
+        const [cols] = await db.query("SHOW COLUMNS FROM users");
+        _userCols = (cols || []).map(c => c.Field);
+    } catch (e) {
+        _userCols = [];
+    }
+    return _userCols;
+}
+
+async function hasCol(c) { const cols = await getUserCols(); return cols.includes(c); }
 
 const authController = {
     register: async (req, res) => {
         try {
             const { name, email, phone, password } = req.body || {};
             if (!email || !password || !name) return res.status(400).json({ success: false, message: 'Missing fields' });
+            const emailCol = await hasCol('email');
+            const usernameCol = await hasCol('username');
 
-            const users = readUsers();
-            if (users.find(u => u.email === email)) return res.status(400).json({ success: false, message: 'Email exists' });
+            // check existing by email or username
+            if (emailCol) {
+                const [rows] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
+                if (rows && rows.length > 0) return res.status(400).json({ success: false, message: 'Email exists' });
+            } else if (usernameCol) {
+                const [rows] = await db.query('SELECT id FROM users WHERE username = ?', [email]);
+                if (rows && rows.length > 0) return res.status(400).json({ success: false, message: 'Email/username exists' });
+            }
 
             const hashed = await bcrypt.hash(password, 10);
-            const user = { id: Date.now(), name, email, phone, password: hashed };
-            users.push(user);
-            writeUsers(users);
+            let userId;
+            if (emailCol) {
+                const [resIns] = await db.query('INSERT INTO users (name, email, phone, password) VALUES (?, ?, ?, ?)', [name, email, phone || '', hashed]);
+                userId = resIns.insertId;
+            } else if (usernameCol) {
+                // fallback to username/role schema
+                const [resIns] = await db.query('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', [email, hashed, 'viewer']);
+                userId = resIns.insertId;
+            } else {
+                return res.status(500).json({ success: false, message: 'Users table schema unsupported' });
+            }
 
-            const token = jwt.sign({ id: user.id, email: user.email }, SECRET, { expiresIn: '7d' });
-            // mark online
-            onlineUsers[user.id] = Date.now();
-            return res.json({ success: true, token, user: { id: user.id, name: user.name, email: user.email, phone: user.phone } });
+            const token = jwt.sign({ id: userId, email }, SECRET, { expiresIn: '7d' });
+            onlineUsers[userId] = Date.now();
+            return res.json({ success: true, token, user: { id: userId, name, email, phone: phone || '' } });
         } catch (err) {
             console.error('Register error', err);
             return res.status(500).json({ success: false, message: 'Register error' });
@@ -47,27 +67,53 @@ const authController = {
         try {
             const { email, password } = req.body || {};
             if (!email || !password) return res.status(400).json({ success: false, message: 'Missing fields' });
-            const users = readUsers();
+            const emailCol = await hasCol('email');
+            const usernameCol = await hasCol('username');
 
-            // Admin login via env credentials
+            // Admin via env
             if (ADMIN_EMAIL && email === ADMIN_EMAIL) {
                 if (!ADMIN_PASSWORD || password !== ADMIN_PASSWORD) {
                     return res.status(400).json({ success: false, message: 'Invalid admin credentials' });
                 }
-                // ensure admin user exists in store
-                let adminUser = users.find(u => u.email === ADMIN_EMAIL);
-                if (!adminUser) {
-                    const hashed = await bcrypt.hash(ADMIN_PASSWORD, 10);
-                    adminUser = { id: Date.now(), name: 'Admin', email: ADMIN_EMAIL, phone: '', password: hashed, isAdmin: true };
-                    users.push(adminUser);
-                    writeUsers(users);
+                // ensure admin exists in DB
+                let adminUser;
+                if (emailCol) {
+                    const [rows] = await db.query('SELECT * FROM users WHERE email = ?', [ADMIN_EMAIL]);
+                    adminUser = rows && rows[0];
+                    if (!adminUser) {
+                        const hashed = await bcrypt.hash(ADMIN_PASSWORD, 10);
+                        const [r] = await db.query('INSERT INTO users (name, email, phone, password, isAdmin) VALUES (?, ?, ?, ?, ?)', ['Admin', ADMIN_EMAIL, '', hashed, 1]);
+                        adminUser = { id: r.insertId, name: 'Admin', email: ADMIN_EMAIL, phone: '', isAdmin: 1 };
+                    }
+                } else if (usernameCol) {
+                    const [rows] = await db.query('SELECT * FROM users WHERE username = ?', [ADMIN_EMAIL]);
+                    adminUser = rows && rows[0];
+                    if (!adminUser) {
+                        const hashed = await bcrypt.hash(ADMIN_PASSWORD, 10);
+                        const [r] = await db.query('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', ['admin', hashed, 'admin']);
+                        adminUser = { id: r.insertId, username: 'admin', role: 'admin' };
+                    }
                 }
-                const token = jwt.sign({ id: adminUser.id, email: adminUser.email, isAdmin: true }, SECRET, { expiresIn: '7d' });
+                const token = jwt.sign({ id: adminUser.id, email: ADMIN_EMAIL, isAdmin: true }, SECRET, { expiresIn: '7d' });
                 onlineUsers[adminUser.id] = Date.now();
-                return res.json({ success: true, token, user: { id: adminUser.id, name: adminUser.name, email: adminUser.email, phone: adminUser.phone, isAdmin: true } });
+                return res.json({ success: true, token, user: { id: adminUser.id, name: adminUser.name || adminUser.username || 'Admin', email: adminUser.email || ADMIN_EMAIL, phone: adminUser.phone || '', isAdmin: true } });
             }
 
-            const user = users.find(u => u.email === email);
+            let user;
+            if (emailCol) {
+                const [rows] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
+                user = rows && rows[0];
+            } else if (usernameCol) {
+                const [rows] = await db.query('SELECT * FROM users WHERE username = ?', [email]);
+                user = rows && rows[0];
+                // normalize fields
+                if (user) {
+                    user.email = user.username;
+                    user.name = user.username;
+                    user.isAdmin = (user.role === 'admin');
+                }
+            }
+
             if (!user) return res.status(400).json({ success: false, message: 'Invalid credentials' });
 
             const ok = await bcrypt.compare(password, user.password);
@@ -75,7 +121,7 @@ const authController = {
 
             const token = jwt.sign({ id: user.id, email: user.email, isAdmin: !!user.isAdmin }, SECRET, { expiresIn: '7d' });
             onlineUsers[user.id] = Date.now();
-            return res.json({ success: true, token, user: { id: user.id, name: user.name, email: user.email, phone: user.phone, isAdmin: !!user.isAdmin } });
+            return res.json({ success: true, token, user: { id: user.id, name: user.name || user.username, email: user.email || user.username, phone: user.phone || '', isAdmin: !!user.isAdmin } });
         } catch (err) {
             console.error('Login error', err);
             return res.status(500).json({ success: false, message: 'Login error' });
@@ -88,12 +134,19 @@ const authController = {
             const token = auth.replace(/^Bearer\s+/, '');
             if (!token) return res.status(401).json({ success: false, message: 'No token' });
             const decoded = jwt.verify(token, SECRET);
-            const users = readUsers();
-            const user = users.find(u => u.id === decoded.id);
+            const emailCol = await hasCol('email');
+            const usernameCol = await hasCol('username');
+            let user;
+            if (emailCol) {
+                const [rows] = await db.query('SELECT id, name, email, phone, isAdmin FROM users WHERE id = ?', [decoded.id]);
+                user = rows && rows[0];
+            } else if (usernameCol) {
+                const [rows] = await db.query('SELECT id, username AS name, NULL AS email, NULL AS phone, (role = "admin") AS isAdmin FROM users WHERE id = ?', [decoded.id]);
+                user = rows && rows[0];
+            }
             if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-            // update online timestamp
             onlineUsers[user.id] = Date.now();
-            return res.json({ success: true, user: { id: user.id, name: user.name, email: user.email, phone: user.phone, isAdmin: !!user.isAdmin } });
+            return res.json({ success: true, user: { id: user.id, name: user.name, email: user.email || '', phone: user.phone || '', isAdmin: !!user.isAdmin } });
         } catch (err) {
             console.error('Me error', err);
             return res.status(401).json({ success: false, message: 'Invalid token' });
@@ -108,8 +161,8 @@ authController.changePassword = async (req, res) => {
         const token = auth.replace(/^Bearer\s+/, '');
         if (!token) return res.status(401).json({ success: false, message: 'No token' });
         const decoded = jwt.verify(token, SECRET);
-        const users = readUsers();
-        const user = users.find(u => u.id === decoded.id);
+        const [rows] = await db.query('SELECT * FROM users WHERE id = ?', [decoded.id]);
+        const user = rows && rows[0];
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
         const { currentPassword, newPassword } = req.body || {};
@@ -118,8 +171,8 @@ authController.changePassword = async (req, res) => {
         const ok = await bcrypt.compare(currentPassword, user.password);
         if (!ok) return res.status(400).json({ success: false, message: 'Current password incorrect' });
 
-        user.password = await bcrypt.hash(newPassword, 10);
-        writeUsers(users);
+        const hashed = await bcrypt.hash(newPassword, 10);
+        await db.query('UPDATE users SET password = ? WHERE id = ?', [hashed, user.id]);
         return res.json({ success: true, message: 'Password changed' });
     } catch (err) {
         console.error('Change password error', err);
@@ -137,9 +190,8 @@ authController.listUsers = async (req, res) => {
         if (!token) return res.status(401).json({ success: false, message: 'No token' });
         const decoded = jwt.verify(token, SECRET);
         if (!decoded.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
-        const users = readUsers();
-        const out = users.map(u => ({ id: u.id, name: u.name, email: u.email, phone: u.phone, isAdmin: !!u.isAdmin }));
-        return res.json({ success: true, users: out });
+        const [rows] = await db.query('SELECT id, name, email, phone, isAdmin FROM users');
+        return res.json({ success: true, users: rows || [] });
     } catch (err) {
         console.error('ListUsers error', err);
         return res.status(500).json({ success: false, message: 'Error' });
@@ -154,9 +206,11 @@ authController.listOnline = async (req, res) => {
         const decoded = jwt.verify(token, SECRET);
         if (!decoded.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
         // return user ids with lastSeen and user info if available
-        const users = readUsers();
-        const list = Object.keys(onlineUsers).map(id => {
-            const u = users.find(x => String(x.id) === String(id));
+        const ids = Object.keys(onlineUsers);
+        if (ids.length === 0) return res.json({ success: true, online: [] });
+        const [rows] = await db.query(`SELECT id, name, email FROM users WHERE id IN (${ids.map(() => '?').join(',')})`, ids);
+        const list = ids.map(id => {
+            const u = rows.find(x => String(x.id) === String(id));
             return { id, lastSeen: new Date(onlineUsers[id]).toISOString(), user: u ? { id: u.id, name: u.name, email: u.email } : null };
         });
         return res.json({ success: true, online: list });
@@ -175,7 +229,6 @@ authController.adminInsert = async (req, res) => {
         const decoded = jwt.verify(token, SECRET);
         if (!decoded.isAdmin) return res.status(403).json({ success: false, message: 'Admin only' });
 
-        const db = require('../database/connection');
         const { table, row } = req.body || {};
         const allowed = ['dashboard_metrics', 'top_products'];
         if (!table || !row || !allowed.includes(table)) return res.status(400).json({ success: false, message: 'Invalid table or row' });
@@ -207,11 +260,10 @@ authController.updateUser = async (req, res) => {
 
         const { id, isAdmin } = req.body || {};
         if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
-        const users = readUsers();
-        const user = users.find(u => String(u.id) === String(id));
+        await db.query('UPDATE users SET isAdmin = ? WHERE id = ?', [isAdmin ? 1 : 0, id]);
+        const [rows] = await db.query('SELECT id, name, email, phone, isAdmin FROM users WHERE id = ?', [id]);
+        const user = rows && rows[0];
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        user.isAdmin = !!isAdmin;
-        writeUsers(users);
         return res.json({ success: true, user: { id: user.id, name: user.name, email: user.email, isAdmin: !!user.isAdmin } });
     } catch (err) {
         console.error('UpdateUser error', err);
@@ -230,12 +282,10 @@ authController.deleteUser = async (req, res) => {
 
         const id = req.params.id;
         if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
-        const users = readUsers();
-        const idx = users.findIndex(u => String(u.id) === String(id));
-        if (idx === -1) return res.status(404).json({ success: false, message: 'User not found' });
-        const removed = users.splice(idx, 1)[0];
-        writeUsers(users);
-        return res.json({ success: true, removed: { id: removed.id, email: removed.email } });
+        const [rows] = await db.query('SELECT id, email FROM users WHERE id = ?', [id]);
+        if (!rows || rows.length === 0) return res.status(404).json({ success: false, message: 'User not found' });
+        await db.query('DELETE FROM users WHERE id = ?', [id]);
+        return res.json({ success: true, removed: { id: rows[0].id, email: rows[0].email } });
     } catch (err) {
         console.error('DeleteUser error', err);
         return res.status(500).json({ success: false, message: 'Error' });

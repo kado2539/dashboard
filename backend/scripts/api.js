@@ -13,7 +13,6 @@ router.get('/kpi/:id/history', biController.getKpiHistory);
 router.get('/products', biController.listProducts);
 router.get('/product/:id/history', biController.getProductHistory);
 router.get('/product/:id/analytics', biController.getProductAnalytics);
-router.get('/product/:id', biController.getProduct);
 router.get('/report', biController.getReport);
 router.post('/report/generate', biController.generateReport);
 router.get('/report/history', biController.getReportHistory);
@@ -29,8 +28,6 @@ router.get('/admin/online', authController.listOnline);
 router.post('/admin/insert', authController.adminInsert);
 router.put('/admin/user', authController.updateUser);
 router.delete('/admin/user/:id', authController.deleteUser);
-// reconciliation
-router.get('/admin/reconcile-products', biController.reconcileProducts);
 
 // settings
 router.get('/settings', biController.getSettings);
